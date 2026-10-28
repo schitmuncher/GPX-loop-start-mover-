@@ -139,7 +139,7 @@
                         <i data-lucide="upload-cloud" class="w-7 h-7 text-emerald-400"></i>
                     </div>
                     <h3 class="text-base sm:text-lg font-bold text-white">Drop your GPX file anywhere</h3>
-                    <p class="text-xs text-slate-400 mt-1">Processed locally in your browser — your route never leaves your device</p>
+                    <p class="text-xs text-slate-400 mt-1">Your route stays in your browser. Only connector endpoints go to a routing service.</p>
                 </div>
 
                 <div class="absolute top-2.5 right-2.5 z-10 flex flex-col items-end gap-1.5">
@@ -460,7 +460,9 @@
             bridgedMeters: 0,
             hoverShiftedIndex: null,
             customStart: null,
-            startMode: 'snap'
+            startMode: 'snap',
+            connectorCache: null,
+            connectorToken: 0
         };
 
         lucide.createIcons();
@@ -594,10 +596,9 @@
             if (state.customStart) {
                 const join = loop[0];
                 const pin = { lat: state.customStart.lat, lon: state.customStart.lon, ele: join.ele ?? 0, time: null };
-                const out = interpolateSpan(pin, join, 'connector');
-                const back = interpolateSpan(join, pin, 'connector');
+                const conn = connectorPointsFor(pin, join);
                 const loopClosed = loop.concat([{ lat: join.lat, lon: join.lon, ele: join.ele ?? 0, time: null }]);
-                return [pin, ...out.points, ...loopClosed, ...back.points, { ...pin }];
+                return [pin, ...conn.out, ...loopClosed, ...conn.back, { ...pin }];
             }
 
             const rotated = loop.slice();
@@ -831,7 +832,7 @@
                     const pos = e.target.getLatLng();
                     setCustomStart(pos.lat, pos.lng, false);
                 });
-                pinMarker.on('dragend', () => renderMapRoute(false));
+                pinMarker.on('dragend', () => requestConnector());
             } else {
                 const activePt = pts[state.startIndex];
                 const newStartMarker = L.marker([activePt.lat, activePt.lon], {
@@ -872,6 +873,92 @@
         /********************************************************************
          * START POINT MODES
          ********************************************************************/
+        // ---- Connector routing: walkable path from the start pin to the loop ----
+        const ROUTER_URL = 'https://router.project-osrm.org/route/v1/foot/';
+        const MAX_ROUTED_DIST_M = 60000;
+        const ROUTE_TIMEOUT_MS = 15000;
+
+        function connectorKey(pin, joinIdx) {
+            return `${pin.lat.toFixed(6)},${pin.lon.toFixed(6)},${joinIdx}`;
+        }
+
+        // Only the two endpoints are sent. Returns [{lat, lon}, ...] or null if no route is available.
+        async function fetchWalkingPath(pin, join) {
+            const url = `${ROUTER_URL}${pin.lon},${pin.lat};${join.lon},${join.lat}?overview=full&geometries=geojson`;
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ROUTE_TIMEOUT_MS);
+            try {
+                const res = await fetch(url, { signal: ctrl.signal });
+                if (!res.ok) return null;
+                const data = await res.json();
+                if (data.code !== 'Ok' || !data.routes || !data.routes[0]) return null;
+                return data.routes[0].geometry.coordinates.map(([lon, lat]) => ({ lat, lon }));
+            } catch (e) {
+                return null;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        /**
+         * Connector geometry between the pin and the loop join point.
+         * Uses the walking path when one is cached for this exact pin and join,
+         * otherwise a straight line. `out` runs pin -> join, `back` runs join -> pin.
+         */
+        function connectorPointsFor(pin, join) {
+            const cache = state.connectorCache;
+            if (cache && cache.path && cache.key === connectorKey(pin, state.startIndex)) {
+                const pathPts = cache.path.map(p => ({ lat: p.lat, lon: p.lon, ele: join.ele ?? 0, time: null }));
+                const out = [
+                    ...interpolateSpan(pin, pathPts[0], 'connector').points,
+                    ...pathPts.map(p => ({ ...p, connector: true })),
+                    ...interpolateSpan(pathPts[pathPts.length - 1], join, 'connector').points
+                ];
+                return { out, back: out.slice().reverse(), real: true };
+            }
+            return {
+                out: interpolateSpan(pin, join, 'connector').points,
+                back: interpolateSpan(join, pin, 'connector').points,
+                real: false
+            };
+        }
+
+        /** Works out the walking route for the current pin and redraws. Only the latest request is kept. */
+        async function requestConnector() {
+            if (!state.customStart || !state.workingPoints.length) return;
+            const pin = state.customStart;
+            const join = state.workingPoints[state.startIndex];
+            const key = connectorKey(pin, state.startIndex);
+            if (state.connectorCache && state.connectorCache.key === key) {
+                updateStatsAndReadouts();
+                renderMapRoute(false);
+                drawElevationProfile();
+                return;
+            }
+
+            const straightM = haversineMeters(pin.lat, pin.lon, join.lat, join.lon);
+            const token = ++state.connectorToken;
+            state.connectorCache = { key, path: null, pending: true, real: false };
+            updateStatsAndReadouts();
+            renderMapRoute(false);
+            drawElevationProfile();
+
+            let path = null;
+            if (straightM > 15 && straightM < MAX_ROUTED_DIST_M) {
+                path = await fetchWalkingPath(pin, join);
+            }
+            if (token !== state.connectorToken) return;
+
+            const usable = path && path.length > 1;
+            state.connectorCache = { key, path: usable ? path : null, pending: false, real: !!usable };
+            updateStatsAndReadouts();
+            renderMapRoute(false);
+            drawElevationProfile();
+            if (!usable && straightM > 15) {
+                showToast('No walking route found, so the connector is a straight line', true);
+            }
+        }
+
         function setCustomStart(lat, lon, redraw = true) {
             if (!state.workingPoints.length) return;
             state.startMode = 'custom';
@@ -880,7 +967,7 @@
             document.getElementById('startIndexSlider').value = state.startIndex;
             applyModeUI();
             updateStatsAndReadouts();
-            if (redraw) renderMapRoute(false);
+            if (redraw) { requestConnector(); return; }
             drawElevationProfile();
         }
 
@@ -897,6 +984,7 @@
                 state.startMode = 'snap';
             }
             applyModeUI();
+            if (state.startMode === 'custom') { requestConnector(); return; }
             updateStatsAndReadouts();
             renderMapRoute(false);
             drawElevationProfile();
@@ -924,7 +1012,7 @@
             });
 
             document.getElementById('modeHelp').textContent = custom
-                ? 'Tap the map or drag the flag to put the start anywhere. The route joins the nearest part of the loop, goes all the way round, then returns to your flag.'
+                ? 'Tap the map or drag the flag to put the start anywhere. The route follows walking paths to the nearest part of the loop, goes all the way round, then walks back to your flag. Only the start and join points are sent to the routing service.'
                 : 'Tap the route or drag the flag to move the start along the loop.';
         }
 
@@ -1188,9 +1276,17 @@
 
             const connInfo = document.getElementById('connectorInfo');
             if (state.customStart) {
-                const each = haversineMeters(state.customStart.lat, state.customStart.lon, joinPt.lat, joinPt.lon);
+                const conn = connectorPointsFor(state.customStart, joinPt);
+                let len = 0;
+                for (let i = 1; i < conn.out.length; i++) len += haversineMeters(conn.out[i - 1].lat, conn.out[i - 1].lon, conn.out[i].lat, conn.out[i].lon);
+                const c = state.connectorCache;
+                const current = c && c.key === connectorKey(state.customStart, state.startIndex) ? c : null;
+                let how = 'straight line';
+                if (current && current.pending) how = 'finding walking route…';
+                else if (current && current.real) how = 'walking route';
+                else if (current && !current.real) how = 'straight line (no walking route found)';
                 connInfo.classList.remove('hidden');
-                connInfo.textContent = `Connector: ${formatDistance(each)} out + ${formatDistance(each)} back to your flag`;
+                connInfo.textContent = `Connector: ${formatDistance(len)} each way, ${how}`;
             } else {
                 connInfo.classList.add('hidden');
             }
@@ -1217,6 +1313,7 @@
 
             state.customStart = null;
             state.startMode = 'snap';
+            state.connectorCache = null;
             recomputeWorkingMetrics();
             setStartIndex(0, false);
             applyModeUI();
@@ -1587,6 +1684,7 @@
                 : 'Standard direction as recorded';
 
             setStartIndex(nearest.index, true);
+            if (state.customStart) requestConnector();
             showToast(state.isReversed ? 'Loop direction reversed' : 'Restored original loop direction');
         });
 
