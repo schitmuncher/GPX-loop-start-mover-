@@ -236,6 +236,11 @@
                             </button>
                         </div>
                         <p id="modeHelp" class="text-[11px] text-slate-400 mt-1.5 leading-relaxed"></p>
+                        <div id="accessBlock" class="hidden space-y-2 pt-1">
+                            <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block">Nearby access</span>
+                            <div id="accessWarning" class="hidden"></div>
+                            <div id="accessList" class="space-y-1"></div>
+                        </div>
                     </div>
                     <div class="grid grid-cols-4 gap-1.5">
                         <div class="bg-slate-950/90 border border-slate-800/80 rounded-xl p-2">
@@ -462,7 +467,9 @@
             customStart: null,
             startMode: 'snap',
             connectorCache: null,
-            connectorToken: 0
+            connectorToken: 0,
+            access: null,
+            accessToken: 0
         };
 
         lucide.createIcons();
@@ -873,6 +880,135 @@
         /********************************************************************
          * START POINT MODES
          ********************************************************************/
+        // ---- Access points: car parks, stations, bus stops and signposts near the start ----
+        const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+        const ACCESS_RADIUS_M = 1500;
+        const ACCESS_REUSE_M = 500;   // reuse the list while the start stays this close to where it was looked up
+        const SNAP_OK_M = 60;         // within this distance counts as "at" an access point
+        const NEAR_ACCESS_M = 250;    // further than this, suggest snapping to the nearest one
+
+        function accessLabel(tags) {
+            if (tags.amenity === 'parking') return 'Car park';
+            if (tags.railway === 'station' || tags.railway === 'halt') return 'Station';
+            if (tags.highway === 'bus_stop') return 'Bus stop';
+            if (tags.highway === 'trailhead') return 'Trailhead';
+            if (tags.information === 'guidepost') return 'Path signpost';
+            return 'Access point';
+        }
+
+        // Only the start point's coordinates and the search radius are sent.
+        async function fetchAccessPoints(lat, lon) {
+            const a = `(around:${ACCESS_RADIUS_M},${lat},${lon})`;
+            const q = `[out:json][timeout:20];(` +
+                `node${a}["amenity"="parking"];way${a}["amenity"="parking"];` +
+                `node${a}["railway"~"^(station|halt)$"];node${a}["highway"="bus_stop"];` +
+                `node${a}["highway"="trailhead"];node${a}["information"="guidepost"];` +
+                `);out center tags 60;`;
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ROUTE_TIMEOUT_MS);
+            try {
+                const res = await fetch(OVERPASS_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'data=' + encodeURIComponent(q),
+                    signal: ctrl.signal
+                });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return (data.elements || []).map(el => {
+                    const la = el.lat ?? el.center?.lat;
+                    const lo = el.lon ?? el.center?.lon;
+                    const tags = el.tags || {};
+                    const type = accessLabel(tags);
+                    return { lat: la, lon: lo, name: tags.name || type, type };
+                }).filter(x => Number.isFinite(x.lat) && Number.isFinite(x.lon));
+            } catch (e) {
+                return null;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        async function requestAccess() {
+            if (!state.customStart) return;
+            const pin = state.customStart;
+            const a = state.access;
+            if (a && a.origin && a.status !== 'error' &&
+                haversineMeters(a.origin.lat, a.origin.lon, pin.lat, pin.lon) < ACCESS_REUSE_M) {
+                renderAccessUI();
+                return;
+            }
+            const token = ++state.accessToken;
+            const origin = { lat: pin.lat, lon: pin.lon };
+            state.access = { origin, status: 'loading', list: [] };
+            renderAccessUI();
+            const list = await fetchAccessPoints(pin.lat, pin.lon);
+            if (token !== state.accessToken) return;
+            state.access = { origin, status: list ? 'ok' : 'error', list: list || [] };
+            renderAccessUI();
+        }
+
+        function snapToAccess(item) {
+            setCustomStart(item.lat, item.lon, true);
+        }
+
+        const TONES = {
+            ok: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200',
+            warn: 'border-amber-500/40 bg-amber-500/10 text-amber-200',
+            info: 'border-slate-700 bg-slate-800/60 text-slate-300'
+        };
+
+        // Never blocks the start. It only suggests a nearby access point and says what is missing.
+        function renderAccessUI() {
+            const box = document.getElementById('accessWarning');
+            const listEl = document.getElementById('accessList');
+            if (!state.customStart || !state.access) return;
+            const pin = state.customStart;
+            const acc = state.access;
+            const items = acc.list
+                .map(x => ({ ...x, dist: haversineMeters(pin.lat, pin.lon, x.lat, x.lon) }))
+                .sort((p, q) => p.dist - q.dist);
+            const nearest = items[0];
+
+            let msg, tone;
+            if (acc.status === 'loading') {
+                msg = 'Looking for car parks, stations and bus stops nearby…'; tone = 'info';
+            } else if (acc.status === 'error') {
+                msg = "Couldn't check nearby access points right now. You can still use this start, but check how you'll get there."; tone = 'warn';
+            } else if (!nearest) {
+                msg = `No car park, station, bus stop or path signpost within ${ACCESS_RADIUS_M / 1000} km. You can still use this start, but check access on the ground.`; tone = 'warn';
+            } else if (nearest.dist <= SNAP_OK_M) {
+                msg = `Starting at ${nearest.name} (${nearest.type}).`; tone = 'ok';
+            } else if (nearest.dist > NEAR_ACCESS_M) {
+                msg = `Nearest access is ${nearest.name} (${nearest.type}), ${Math.round(nearest.dist)} m away. Tap it below to start there, or keep this point.`; tone = 'warn';
+            } else {
+                msg = `Close to ${nearest.name} (${nearest.type}), ${Math.round(nearest.dist)} m away.`; tone = 'ok';
+            }
+            const c = state.connectorCache;
+            if (c && !c.pending && !c.real && acc.status !== 'loading') {
+                msg += ' No walking route found from here to the loop, so check the path before you set off.';
+                tone = 'warn';
+            }
+            box.className = `text-[11px] rounded-lg px-2.5 py-2 border ${TONES[tone]}`;
+            box.textContent = msg;
+
+            listEl.innerHTML = '';
+            items.slice(0, 6).forEach(item => {
+                const b = document.createElement('button');
+                const atThis = item.dist <= SNAP_OK_M;
+                b.className = `w-full text-left px-2.5 py-1.5 rounded-lg bg-slate-950 border text-[11px] flex justify-between items-center gap-2 transition hover:border-emerald-500 ${atThis ? 'border-emerald-500' : 'border-slate-800'}`;
+                const left = document.createElement('span');
+                left.className = 'truncate text-slate-200';
+                left.textContent = `${item.name}`;
+                const right = document.createElement('span');
+                right.className = 'font-mono text-slate-400 shrink-0';
+                right.textContent = `${item.type} • ${Math.round(item.dist)} m`;
+                b.append(left, right);
+                b.addEventListener('click', () => snapToAccess(item));
+                listEl.appendChild(b);
+            });
+        }
+
         // ---- Connector routing: walkable path from the start pin to the loop ----
         const ROUTER_URL = 'https://router.project-osrm.org/route/v1/foot/';
         const MAX_ROUTED_DIST_M = 60000;
@@ -936,6 +1072,7 @@
                 return;
             }
 
+            requestAccess();
             const straightM = haversineMeters(pin.lat, pin.lon, join.lat, join.lon);
             const token = ++state.connectorToken;
             state.connectorCache = { key, path: null, pending: true, real: false };
@@ -1011,8 +1148,9 @@
                 b.classList.toggle('cursor-not-allowed', custom);
             });
 
+            document.getElementById('accessBlock').classList.toggle('hidden', !custom);
             document.getElementById('modeHelp').textContent = custom
-                ? 'Tap the map or drag the flag to put the start anywhere. The route follows walking paths to the nearest part of the loop, goes all the way round, then walks back to your flag. Only the start and join points are sent to the routing service.'
+                ? 'Tap the map or drag the flag to put the start anywhere. The route follows walking paths to the nearest part of the loop, goes all the way round, then walks back to your flag. Nearby access points are looked up from OpenStreetMap data.'
                 : 'Tap the route or drag the flag to move the start along the loop.';
         }
 
@@ -1293,6 +1431,7 @@
 
             document.getElementById('eleMinStat').textContent = formatElevation(stats.minEle);
             document.getElementById('eleMaxStat').textContent = formatElevation(stats.maxEle);
+            if (state.customStart) renderAccessUI();
         }
 
         /**
@@ -1314,6 +1453,7 @@
             state.customStart = null;
             state.startMode = 'snap';
             state.connectorCache = null;
+            state.access = null;
             recomputeWorkingMetrics();
             setStartIndex(0, false);
             applyModeUI();
